@@ -1,0 +1,132 @@
+\documentclass[10pt]{article}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,booktabs,microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=1.2em}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\pagestyle{empty}
+\newcommand{\sect}[1]{\par\vspace{5pt}{\bfseries #1}\par\vspace{1pt}}
+\begin{document}
+
+{\large\bfseries ProtocolQA: Haiku 5.5 vs.\ GPT-6 Luna vs.\ GLM 5.3 Flash}\par
+\vspace{2pt}
+
+\sect{Eval design}
+\textbf{Data.} The 108 public multiple-choice questions of LAB-Bench ProtocolQA (Laurent
+et al., 2024; 27 more are held out). The authors and contracted biologists introduced
+errors into published protocols by modifying or omitting steps. Each question gives the
+full protocol (103--2,642 words) and an observed failure (e.g.\ low PBMC yield) and asks
+which change fixes it. Options: one correct answer, 3--6 distractors, and an
+``insufficient information'' abstain option (chance $\approx$ 19\%). The 20 open-answer
+items were skipped (scoring needs an LLM judge; out of scope).
+
+\textbf{What it measures.} Text-only protocol troubleshooting: tracing a symptom to the
+faulty step and choosing the fix from fixed options, which takes domain knowledge and
+careful reading of a long procedure. It does not test protocol design, open-ended
+troubleshooting, tool or literature use, or real lab outcomes.
+
+\textbf{Protocol.} Zero-shot with the original LAB-Bench chain-of-thought prompt, via
+OpenRouter pinned to first-party endpoints. Reasoning effort \texttt{high}, 32k-token
+output limit. 5 repeats per question with a seeded choice order shared by all models (540
+calls per model). Coverage = share of calls answered (not abstained, blocked, or refused);
+precision = correct/answered. CIs bootstrap over questions; pairs: sign-flip test.
+
+\sect{Eval results}
+\vspace{-4pt}\begin{center}\small
+\begin{tabular}{lcccccc}
+\toprule
+Model & Accuracy [95\% CI] & Precision & Coverage & Blocked & Refused & Cost \\
+\midrule
+GLM 5.3 Flash & \textbf{0.678} [0.604, 0.750] & 0.696 & 0.974 & 0 & 0 & \$0.22 \\
+Haiku 5.5     & 0.644 [0.565, 0.722] & 0.753 & 0.856 & 5 & 0 & \$0.38 \\
+GPT-6 Luna    & 0.619 [0.539, 0.696] & \textbf{0.771} & 0.802 & 24 & 11 & \$0.22 \\
+\bottomrule
+\end{tabular}
+\end{center}\vspace{-6pt}
+\begin{itemize}
+\item \textbf{No significant accuracy differences.}
+All fit within each other's confidence interval.
+\item \textbf{Different pathologies}. GLM almost never abstains (highest accuracy,
+  lowest precision). Haiku and Luna abstain more and are right more often when they commit.
+\item \textbf{Safety filters cost Luna the most.} OpenAI's bio-risk filter blocked 15
+  questions at least once and Luna declined 8 (mostly virus-related); Haiku was blocked on
+  1. On the 87 questions with no block or refusal, all three are within 3 pts (GLM 0.697,
+  Luna 0.687, Haiku 0.667).
+\item \textbf{There is little spread within a single model / single question.} Five repeats
+  narrowed CIs only from about $\pm$9 to $\pm$8 pts. Caveats: public split only; possible
+  training contamination.
+\end{itemize}
+
+\sect{RL environments (BioProBench): proposal}
+\textbf{Tasks.} We propose turning four single-turn BioProBench tasks (Liu et al., 2026;
+CC BY-NC) into environments, since each has gold labels that can be checked automatically.
+Training uses the Hugging Face train splits, minus 1,000 validation items per task. The
+official test splits are held out (overlap with train is $\le$3 items per task). Protocol
+generation (GEN) is excluded because its only rewards are reference-similarity scores (BLEU,
+embeddings), which are easy to game.
+
+\vspace{-2pt}\begin{center}\small
+\begin{tabular}{@{}lp{4.3cm}rp{6.4cm}@{}}
+\toprule
+Task & Model sees $\rightarrow$ returns & Train & Proposed reward (in $[0,1]$) \\
+\midrule
+PQA & Protocol sentence with a blank, 5 options $\rightarrow$ option + confidence & 47,083 &
+  $0.9\cdot\mathrm{correct} + 0.1\cdot(1-(c/100-\mathrm{correct})^2)$: correctness plus
+  a small calibration term \\
+ERR & One step + purpose and neighboring steps $\rightarrow$ True/False & 93,049 &
+  1 if the verdict matches the label, else 0 \\
+ORD & Shuffled steps $\rightarrow$ index permutation & 27,549 &
+  $0.5\cdot\mathrm{exact} + 0.5\cdot(\tau+1)/2$ (Kendall's $\tau$; the order of identical
+  steps is ignored) \\
+REA & ERR + written analysis of operation, reagent, and parameter errors & (ERR) &
+  $\mathrm{correct}\cdot(0.7+0.3\cdot\mathrm{judge})$ on items that contain an error;
+  the LLM-judge bonus never rescues a wrong verdict \\
+\bottomrule
+\end{tabular}
+\end{center}\vspace{-6pt}
+\begin{itemize}
+\item \textbf{Training signal.} All rewards score the final answer only, with no
+  credit for intermediate steps. PQA and ERR are essentially binary. ORD gives partial
+  credit. REA is the only signal on reasoning, and it is noisier because it relies on a
+  judge. Only the last answer block counts, and missing, malformed, or truncated answers
+  score 0, so the reward also enforces the answer format. Parsing is strict:
+  ERR accepts only an exact \texttt{True}/\texttt{False}, because the original scorer counts any
+  answer containing ``true'' as True (copying the prompt's ``True or False'' template
+  scores $\approx$50\%).
+\item \textbf{Data cleaning.} We would drop 3,228 ERR train items (7\% of the error items)
+  that are labeled erroneous but show the corrected step, 200 step texts that carry both
+  labels, malformed items, and duplicates. This should leave about 46k PQA, 87k ERR, and
+  26k ORD items.
+\item \textbf{Reward tests (before training).} (i) The gold answer for every item should
+  score 1. (ii) Unit tests should give 0 to known exploits: template echo, ``untrue'',
+  1-based or partial index lists, missing or repeated tags. (iii) Random and constant
+  policies should land at the no-skill floors (PQA 0.2, ERR 0.5, ORD at the computed random
+  level). (iv) The rewards should agree with the original BioProBench scorers on
+  well-formed outputs.
+\item \textbf{Training runs.} GRPO on a small open instruct model (1--4B parameters). Runs:
+  a zero-shot baseline, one single-task run each for PQA, ERR, and ORD, a mixed-task run,
+  and REA with and without the judge bonus. Each run stops early on mean validation
+  reward (higher is better, $\Delta_{\min}=0.005$, patience 5 evaluations), and we keep the
+  best checkpoint. During training we would watch per-class ERR accuracy (to catch
+  collapse to one label), parse failures, output length, KL to the base model, and the
+  gap between the judge score and verdict accuracy for REA (a sign of judge gaming).
+\item \textbf{Evaluation.} BioProBench test results with the paper's metrics, plus
+  \emph{the ProtocolQA eval above}, to test whether BioProBench training transfers to
+  troubleshooting on a separate benchmark.
+\end{itemize}
+
+\sect{Next steps (one more week)}
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Separate filtering from ability.} Re-ask blocked and refused items through
+  other endpoints, then report both ``as deployed'' and ``answered-only'' scores.
+\item \textbf{Open-answer scoring.} Two off-the-shelf judges map free-text answers to the
+  stored options, validated on known answers, to test whether the options do the work.
+\item \textbf{Effort sweep and error taxonomy.} Run \texttt{low}/\texttt{high}/\texttt{max}
+  effort to get accuracy-vs-cost curves. Tag items by error type (omission, quantity,
+  ordering, condition) to see where each model fails.
+\item \textbf{More power.} Add related public tasks; 108 items cannot resolve $\sim$6-pt gaps.
+\end{enumerate}
+\end{document}
